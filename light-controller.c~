@@ -1,0 +1,125 @@
+#include <avr/io.h>
+#include <avr/eeprom.h>
+#include <avr/interrupt.h>
+
+// Pins
+#define ON 0x10
+#define OFF 0x08
+#define DIM 0x02
+#define PWM 0x01
+#define SENSE 0x04
+
+// EEPROM Addresses
+#define OFF_TIME_ADDR    (const uint8_t *) 0x00 // Time to remain off in minutes
+#define RAMP_TIME_ADDR 	 (const uint8_t *) 0x01 // Time in tens of seconds for wake fade
+#define FADE_TIME_ADDR   (const uint8_t *) 0x02 // Time to fade in tenths of secs
+#define DIM_LVL_ADDR     (const uint8_t *) 0x03
+
+#define BOUNCE_OVF 10
+
+
+// Globals
+unsigned int ramp_time, fade_time;
+unsigned char dim_level;
+unsigned int off_time;
+
+float current_level;
+float volatile step_size;
+unsigned char volatile target_level;
+unsigned char volatile bounce;
+unsigned long volatile sleep_remaining = 0;
+
+// Clock cycle is 0.0000133 sec
+// Overflow is 3ms
+
+// Fade to the specified level over the specified time (in tenths of a second) 
+void fade(unsigned char brightness, unsigned int time){
+	target_level = brightness;
+	step_size = (target_level-current_level)/time/34; // Steps per overflow (not time*34 to avoid overflow)
+
+}
+
+// On
+ISR(PCINT3_vect){
+	if(bounce == 0){
+		sleep_remaining = 0;
+		fade(255, fade_time);
+		bounce = BOUNCE_OVF;
+	}
+}
+
+
+// Off
+ISR(PCINT4_vect){
+	if(bounce == 0){
+		sleep_remaining = off_time;
+		sleep_remaining *= (60*293);
+		fade(0, fade_time);
+		bounce = BOUNCE_OVF;
+	}
+}
+
+// Dim
+ISR(PCINT1_vect){
+	if(bounce == 0){
+		sleep_remaining = off_time;
+		fade(dim_level, fade_time);
+		bounce = BOUNCE_OVF;
+	}
+}
+
+// Overflow
+ISR(TIM0_OVF_vect){
+
+	// Decrement debounce counters
+	if(bounce > 0)
+		bounce--;
+
+	// Manage sleep counter
+	if(sleep_remaining > 0){
+		sleep_remaining--;
+		if(sleep_remaining == 0)
+			fade(255, ramp_time);
+	}
+
+	// Manage fade
+	float diff = target_level-current_level;
+	if(diff > 0.1 || diff < -0.1){
+		if( (diff > 0 && diff > step_size) || (diff < 0 &&  diff < step_size) )
+			current_level += step_size;
+		else
+			current_level += diff;
+
+		OCR0A = (unsigned char)current_level;
+	}
+
+}
+
+
+// Setup the registers and read settings from EEPROM
+int main(){
+	// Read settings from EEPROM
+	off_time 	= ((unsigned int )eeprom_read_byte(OFF_TIME_ADDR ));
+	ramp_time   = ((unsigned int )eeprom_read_byte(RAMP_TIME_ADDR))*100;
+	fade_time   = ((unsigned int )eeprom_read_byte(FADE_TIME_ADDR));
+	dim_level	= ((unsigned char)eeprom_read_byte(DIM_LVL_ADDR));
+
+	DDRB |= PWM; // Set SWITCH to output
+	DDRB &= ~(ON | DIM | OFF | SENSE); // Set ON, OFF, DIM, SENSE to input
+
+	TIMSK0 |= 0x02; // Enable timer overflow interrupts
+
+	GIMSK |= 0x20; // Enable Pin Change interrupts
+	PCMSK |= 0x1A; // Interupt on 1, 3, 4
+
+	// Enable PWM on OCR0A
+	TCCR0B |= 0x03; // Divide clock by 64	
+	TCCR0A |= 0x83; // Fast PWM
+	current_level = 255;
+	target_level = 255;
+	OCR0A = 255; // Start lights at full
+
+	sei(); // Enable global interrupts
+}
+
+
